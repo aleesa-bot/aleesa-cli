@@ -1,0 +1,13 @@
+{
+    "server"  : "redis",
+    "port"    : 6379,
+
+    "channel" : "cli",
+    "router_channel": "misc",
+
+    # bot commands will begin with this symbol
+    "csign"   : "!",
+
+    # bot nick name
+    "botnick" : "aleesa"
+}

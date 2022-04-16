@@ -1,0 +1,467 @@
+#!/usr/bin/perl
+
+
+use 5.018; ## no critic (ProhibitImplicitImport)
+use strict;
+use warnings;
+use utf8;
+use open qw (:std :utf8);
+use English qw ( -no_match_vars );
+
+use version; our $VERSION = qw (1.0);
+
+my $workdir;
+
+# До фактического запуска логики программы, сменим рабочий каталог, чтобы подцепить либы
+BEGIN {
+	use Cwd qw (chdir abs_path);
+	my @CWD = split /\//xms, abs_path ($PROGRAM_NAME);
+
+	if ($#CWD > 1) {
+		$#CWD = $#CWD - 1;
+	}
+
+	$workdir = join '/', @CWD;
+	chdir $workdir;
+}
+
+use lib ("$workdir/lib", "$workdir/vendor_perl", "$workdir/vendor_perl/lib/perl5");
+
+use Clone qw (clone);
+use JSON::XS ();
+use Mojo::IOLoop::LineReader ();
+use Mojo::Redis ();
+use Mojo::IOLoop::Signal ();
+
+my $c = LoadConf ();
+
+my $redis;
+my $pubsub;
+my %subchannels;
+my @monchannels;
+my $reader;
+my $mydebug = 0;
+my $myverbose = 0;
+my $public_mode = 0;
+my $monitor = 0;
+
+if (defined $c->{debug}) {
+	$mydebug = $c->{debug};
+}
+
+if (defined $c->{verbose}) {
+	$myverbose = $c->{verbose};
+}
+
+my $help = << "EOH";
+debug              - display debug mode status
+debug 1            - enable debug (you probably interest in verbose more)
+debug 0            - disable debug (default)
+mode               - show conversation mode
+mode private       - conversation in private mode (default)
+mode public        - conversation in public mode
+mode monitor       - sniffs subscribed channels
+mon add channel    - add channel to bunch of monitored ones
+mon remove channel - remove channel from list of monitored ones, $c->{channel} is always monitored
+mon delete channel - remove channel from list of monitored ones, $c->{channel} is always monitored
+mon del channel    - remove channel from list of monitored ones, $c->{channel} is always monitored
+verbose            - show vebose mode status
+verbose 1          - show tx/rx messages also as json
+verbose 0          - disable verbose mode (default)
+exit               - quit cli
+quit               - quit cli
+EOH
+
+my $redismsg->{from}              = 'cli';
+$redismsg->{plugin}               = 'cli';
+$redismsg->{userid}               = 'cli';
+$redismsg->{chatid}               = 'cli';
+$redismsg->{mode}                 = 'private';
+$redismsg->{misc}->{answer}       = 1;
+
+if (defined $c->{botnick}) {
+	$redismsg->{misc}->{botnick} = "$c->{botnick}";
+} else {
+	$redismsg->{misc}->{botnick} = 'aleesa';
+}
+
+if (defined $c->{csign}) {
+	$redismsg->{misc}->{csign} = "$c->{csign}";
+} else {
+	$redismsg->{misc}->{csign} = '!';
+}
+
+$redismsg->{misc}->{msg_format}   = 0;
+$redismsg->{misc}->{fwd_cnt}      = 1;
+$redismsg->{misc}->{good_morning} = 0;
+$redismsg->{misc}->{username}     = 'user';
+
+# Процедура обработки сигнала
+my $__signal_handler = sub {
+	my ($self, $name) = @_;
+	exit 0;
+};
+
+# Процедура, реагирующая на строку, пойманную с клавиатуры
+my $__input_line_handler = sub {
+	my ($self, $line) = @_;
+	chomp $line;
+
+	if ($line =~ /^(exit|quit)$/) { ## no critic (RegularExpressions::ProhibitFixedStringMatches)
+		print "Quit\n";
+		$__signal_handler->($self, 'Quit');
+	} elsif ($line eq 'help') {
+		print "$help\n";
+	} elsif ($line =~ /^mode\s+(.*)$/) {
+		if ($1 eq 'public') {
+			$public_mode = 1;
+
+			if ($monitor) {
+				unsubscribe_channels (keys (%subchannels));
+				subscribe_channels ($c->{channel});
+				$monitor = 0;
+			}
+
+			print "[info]: continue conversation in public mode\n";
+		} elsif ($1 eq 'private') {
+			$public_mode = 0;
+
+			if ($monitor) {
+				unsubscribe_channels (keys (%subchannels));
+				subscribe_channels ($c->{channel});
+				$monitor = 0;
+			}
+
+			print "[info]: continue conversation in private mode\n";
+		} elsif ($1 eq 'monitor') {
+			$monitor = 1;
+			my @channels = keys %subchannels;
+			my @sniffchannels = @monchannels;
+			unsubscribe_channels (@channels);
+			subscribe_channels (@sniffchannels);
+			printf "[info]: switched to redis channel sniffing mode, monitoring theese pubsub channels: %s\n", join (', ',@monchannels);
+		} else {
+			my $message = '[info]: conversation now in ';
+
+			if ($monitor) {
+				$message = "[info]: monitor mode is on and coversation with bot disabled\n";
+				$message .= sprintf "[info]: monitoring these pubsub channels: %s\n", join (', ',@monchannels);
+			} else {
+				if ($public_mode) {
+					$message .= "public mode\n";
+				} else {
+					$message .= "private mode\n";
+				}
+			}
+
+			print $message;
+		}
+	} elsif ($line eq 'mode') {
+		my $message = '[info]: conversation now in ';
+
+		if ($monitor) {
+			$message = "[info]: monitor mode is on and coversation with bot disabled\n";
+		} else {
+			if ($public_mode) {
+				$message .= "public mode\n";
+			} else {
+				$message .= "private mode\n";
+			}
+		}
+
+		print $message;
+	} elsif ($line =~ /^mon\s+(add|remove|del|delete)\s+(.+)/) {
+		# Список каналов
+		my $command = $1;
+		my $list = $2;
+		$list =~ s/^\s+//u;
+		$list =~ s/\s+$//u;
+
+		if ($list eq '') {
+			print "[info]: looks like list of channels is empty\n";
+		} else {
+			my @channels = split /(\s*)?\,?\s+/, $list;
+
+			# Команда была "добавить"
+			if ($command eq 'add') {
+				if ($monitor) {
+					my @newchannels;
+
+					foreach my $channel (@channels) {
+						my $subscribe = 1;
+
+						foreach my $subchannel (keys %subchannels) {
+							if ($subchannel eq $channel) {
+								$subscribe = 0;
+								last;
+							}
+						}
+
+						push @newchannels, $channel if ($subscribe);
+					}
+
+					if ($#newchannels >= 0) {
+						subscribe_channels (@newchannels);
+					}
+
+					printf "[info]: now subscribed to these channels: %s\n", join (', ', keys %subchannels);
+				} else {
+					my %list;
+					foreach (@monchannels) {$list{$_} = 1;}
+					foreach (@channels) {$list{$_} = 1;}
+					$#monchannels = -1;
+					@monchannels = keys %list;
+					printf "[info]: list of monitored channels: %s\n", join (', ', @monchannels);
+				}
+			# Команда была "убрать"
+			} else {
+				if ($monitor) {
+					my @unsub_channels;
+
+					foreach my $channel (@channels) {
+						my $unsubscribe = 0;
+						next if $channel eq $c->{channel};
+
+						foreach my $subchannel (keys %subchannels) {
+							if ($subchannel eq $channel) {
+								$unsubscribe = 1;
+								last;
+							}
+						}
+
+						push @unsub_channels, $channel if ($unsubscribe);
+					}
+
+					if ($#unsub_channels >= 0) {
+						unsubscribe_channels (@unsub_channels);
+					}
+
+					printf "[info]: now subscribed to these channels: %s\n", join (', ', keys %subchannels);
+				} else {
+					my %list;
+					foreach (@monchannels) {$list{$_} = 1;}
+
+					foreach (@channels) {
+						next if $_ eq $c->{channel};
+						delete $list{$_} if ($list{$_});
+					}
+
+					$#monchannels = -1;
+					@monchannels = keys %list;
+					printf "[info]: list of monitored channels: %s\n", join (', ', @monchannels);
+				}
+			}
+		}
+	} elsif ($line eq 'mon') {
+		printf "[info]: list of monitored channels: %s\n", join (', ', @monchannels);
+	} elsif ($line =~ /^debug\s+(\d)$/) {
+		if ($1 eq '1') {
+			$mydebug = 1;
+			print "[info]: debug set to 1\n";
+		} elsif ($1 eq '0') {
+			$mydebug = 0;
+			print "[info]: debug set to 0\n";
+		}
+	} elsif ($line eq 'debug') {
+		print "[info]: debug is $mydebug\n";
+	} elsif ($line =~ /^verbose\s+(\d)$/) {
+		if ($1 eq '1') {
+			$myverbose = 1;
+			print "[info]: verbose set to 1\n";
+		} elsif ($1 eq '0') {
+			$myverbose = 0;
+			print "[info]: verbose set to 0\n";
+		}
+	} elsif ($line eq 'verbose') {
+		print "[info]: verbose is $myverbose\n";
+	} else {
+		# Будем дрыхнуть до того момента, пока не установится соединение к redis
+		until (defined $pubsub) {
+			sleep 1;
+		}
+
+		# В режиме монитора у нас есть чем занять консоль, поэтому общаться с потрохами бота в этом инстансе мы
+		# прекращаем до выхода в обычный режим - private или public
+		unless ($monitor) {
+			my $msg         = clone $redismsg;
+			$msg->{message} = $line;
+
+			if ($public_mode) {
+				$msg->{mode} = 'public';
+			} else {
+				$msg->{mode} = 'private';
+			}
+
+			if ($line ne '') {
+				if ($mydebug || $myverbose) {
+					my $json = JSON::XS->new ()->pretty (1)->canonical (1)->encode ($msg);
+					warn "[sent]: $json\n";
+				}
+
+				$pubsub->json ($c->{router_channel})->notify (
+					$c->{router_channel} => $msg,
+				);
+			}
+		}
+	}
+};
+
+# Процедура обработки входящего сообщения из redis pubsub канала
+my $parse_message = sub {
+	my $self = shift;
+	my $msg = shift;
+
+	# Что-то от модулей надо парсить, например, сообщения бармэна.
+	if ($mydebug || $myverbose || $monitor) {
+		my $json = JSON::XS->new ()->pretty (1)->canonical (1)->encode ($msg);
+		warn "[recieved]: $json\n";
+	}
+
+	printf "[%s]: %s\n", $c->{botnick}, $msg->{message} unless ($monitor);
+
+	return;
+};
+
+# Создадим подключение к Redis-ке
+warn "[debug]: Connecting to $c->{server}, $c->{port}\n" if $mydebug;
+$redis = Mojo::Redis->new (
+	sprintf 'redis://%s:%s/1', $c->{server}, $c->{port},
+);
+
+warn "[debug]: Registering redis connection-event callback\n" if $mydebug;
+$redis->on (
+	connection => sub {
+		my ($r, $connection) = @_;
+
+		# Залоггируем ошибку, если соединение внезапно порвалось.
+		# FIXME: Похоже, что $mydebug в данном случае становится локальной, а не остаётся глобальной переменной.
+		warn "[debug]: Registering redis events callbacks\n" if $mydebug;
+
+		$connection->on (
+			close => sub {
+				die "[error]: Connection to redis is closed\n";
+			},
+		);
+
+		# FIXME: Похоже, что $mydebug в данном случае становится локальной, а не остаётся глобальной переменной.
+		$connection->on (
+			connect => sub {
+				warn "[debug]: Connection to redis established\n" if $mydebug;
+			},
+		);
+
+		$connection->on (
+			error => sub {
+				my ($conn, $error) = @_;
+				die "[error]: Redis connection error: $error\n";
+			},
+		);
+
+		return;
+	},
+);
+
+warn "[debug]: Registering subscribtion callback\n" if $mydebug;
+$pubsub = $redis->pubsub;
+subscribe_channels ($c->{channel});
+
+# Повесим коллбэки на сигналы TERM, QUIT, HUP, INT
+warn "[debug]: Registering signal handler callbacks\n" if $mydebug;
+Mojo::IOLoop::Signal->on (TERM => $__signal_handler);
+Mojo::IOLoop::Signal->on (QUIT => $__signal_handler);
+Mojo::IOLoop::Signal->on (HUP  => $__signal_handler);
+Mojo::IOLoop::Signal->on (INT  => $__signal_handler);
+
+# Установим читателя с терминала
+register_input_callback ();
+
+# Запустим Event Loop
+warn "[debug]: Starting event loop\n" if $mydebug;
+print "\nTo show help just enter help command\n";
+print "Ready to begin conversation with $c->{botnick}\n\n";
+do { Mojo::IOLoop->start } until Mojo::IOLoop->is_running; ## no critic (Modules::RequireExplicitInclusion)
+
+exit 0;
+
+
+sub register_input_callback {
+	warn "[debug]: Registering terminal input callback\n" if $mydebug;
+	my $stdin = \*STDIN;
+	binmode $stdin;
+	$reader = Mojo::IOLoop::LineReader->new ($stdin);
+	$reader->timeout (0);
+
+	# Повесим коллбэк на чтение строки текста с stdin
+	$reader->on (
+		readln => $__input_line_handler,
+	);
+
+	$reader->start;
+
+	return;
+}
+
+sub subscribe_channels {
+	my @channels = @_;
+
+	foreach my $channel (@channels) {
+		warn "[debug]: Subscribing to redis pubsub channel $channel\n" if $mydebug;
+
+		my $cb = $pubsub->json ($channel)->listen (
+			$channel => sub { $parse_message->(@_); },
+		);
+
+		$subchannels{$channel} = $cb;
+	}
+
+	$#monchannels = -1;
+	@monchannels = keys %subchannels;
+
+	return;
+}
+
+sub unsubscribe_channels {
+	my @channels = @_;
+
+	foreach my $channel (@channels) {
+		warn "[debug]: Unsubscribing to redis pubsub channel $channel\n" if $mydebug;
+		$pubsub = $pubsub->unlisten ($channel, $subchannels{$channel});
+		delete $subchannels{$channel};
+	}
+
+	$#monchannels = -1;
+	@monchannels = keys %subchannels;
+
+	return;
+}
+
+sub LoadConf {
+	my $confFile = 'config.json';
+	my $CH;
+
+	unless (open $CH, '<', $confFile) {
+		die "[error]: No conf at $confFile: $OS_ERROR\n";
+	}
+
+	my $len = (stat $confFile) [7];
+	my $json;
+	use bytes;
+	my $readlen = read $CH, $json, $len;
+	no bytes;
+
+	unless ($readlen) {
+		close $CH;
+		die "[error]: Unable to read $confFile: $OS_ERROR\n";
+	}
+
+	if ($readlen != $len) {
+		close $CH;
+		die "[error]: File $confFile is $len bytes on disk, but we read only $readlen bytes\n";
+	}
+
+	close $CH;
+	my $j = JSON::XS->new->utf8->relaxed;
+	return $j->decode ($json);
+}
+
+# vim: set ft=perl noet ai ts=4 sw=4 sts=4:
