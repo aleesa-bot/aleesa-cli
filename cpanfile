@@ -1,6 +1,7 @@
 ## no critic
 requires 'Clone',                    '==0.45';
 requires 'Cwd',                      '==3.75';
+requires 'Encode',                   '==3.17';
 requires 'JSON::XS',                 '==4.03';
 requires 'local::lib',               '==2.000028';
 requires 'Mojo::Redis',              '==3.29';

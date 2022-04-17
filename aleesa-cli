@@ -28,6 +28,7 @@ BEGIN {
 use lib ("$workdir/lib", "$workdir/vendor_perl", "$workdir/vendor_perl/lib/perl5");
 
 use Clone qw (clone);
+use Encode qw (decode_utf8);
 use JSON::XS ();
 use Mojo::IOLoop::LineReader ();
 use Mojo::Redis ();
@@ -105,6 +106,7 @@ my $__signal_handler = sub {
 # Процедура, реагирующая на строку, пойманную с клавиатуры
 my $__input_line_handler = sub {
 	my ($self, $line) = @_;
+	$line = decode_utf8 ($line);
 	chomp $line;
 
 	if ($line =~ /^(exit|quit)$/) { ## no critic (RegularExpressions::ProhibitFixedStringMatches)
