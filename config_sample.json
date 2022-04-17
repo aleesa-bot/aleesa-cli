@@ -9,5 +9,5 @@
     "csign"   : "!",
 
     # bot nick name
-    "botnick" : "aleesa"
+    "bot_nick" : "aleesa"
 }

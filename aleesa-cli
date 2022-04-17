@@ -79,10 +79,10 @@ $redismsg->{chatid}               = 'cli';
 $redismsg->{mode}                 = 'private';
 $redismsg->{misc}->{answer}       = 1;
 
-if (defined $c->{botnick}) {
-	$redismsg->{misc}->{botnick} = "$c->{botnick}";
+if (defined $c->{bot_nick}) {
+	$redismsg->{misc}->{bot_nick} = "$c->{bot_nick}";
 } else {
-	$redismsg->{misc}->{botnick} = 'aleesa';
+	$redismsg->{misc}->{bot_nick} = 'aleesa';
 }
 
 if (defined $c->{csign}) {
@@ -317,7 +317,7 @@ my $parse_message = sub {
 		warn "[recieved]: $json\n";
 	}
 
-	printf "[%s]: %s\n", $c->{botnick}, $msg->{message} unless ($monitor);
+	printf "[%s]: %s\n", $c->{bot_nick}, $msg->{message} unless ($monitor);
 
 	return;
 };
@@ -378,7 +378,7 @@ register_input_callback ();
 # Запустим Event Loop
 warn "[debug]: Starting event loop\n" if $mydebug;
 print "\nTo show help just enter help command\n";
-print "Ready to begin conversation with $c->{botnick}\n\n";
+print "Ready to begin conversation with $c->{bot_nick}\n\n";
 do { Mojo::IOLoop->start } until Mojo::IOLoop->is_running; ## no critic (Modules::RequireExplicitInclusion)
 
 exit 0;
